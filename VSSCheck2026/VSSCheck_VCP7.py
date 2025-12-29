@@ -3,23 +3,29 @@ import subprocess
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import font as tkfont
+import platform
 
-EXE_PATH = r"C:\VCP-Lite\Base\FELINK\Security\Lockdown_active.exe"
+EXE_PATH = os.environ.get("VSS_EXE_PATH", r"C:\VCP-Lite\Base\FELINK\Security\Lockdown_active.exe")
 APP_VERSION = "Version 2.0 VCP Lite7"
 
 def on_lockdown():
+    lock_btn.config(state=tk.DISABLED)
     if not os.path.exists(EXE_PATH):
         messagebox.showerror("Error", f"File not found:\n{EXE_PATH}")
+        lock_btn.config(state=tk.NORMAL)
         return
 
     try:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
         subprocess.Popen(
             [EXE_PATH],
             shell=False,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=creation_flags
         )
+        messagebox.showinfo("Launched", "Lockdown process started.")
         root.destroy()
     except Exception as e:
+        lock_btn.config(state=tk.NORMAL)
         messagebox.showerror("Error", f"Cannot start:\n{EXE_PATH}\n\n{e}")
 
 root = tk.Tk()
@@ -46,7 +52,8 @@ frame.pack(expand=True)
 
 tk.Label(frame, text="VSS Policy not Activate!", fg="red", font=title_font).pack(pady=(10, 10))
 tk.Label(frame, text="Please Lockdown Policy", fg="blue", font=msg_font).pack(pady=(0, 25))
-tk.Button(frame, text="LOCKDOWN", width=14, height=2, command=on_lockdown).pack()
+lock_btn = tk.Button(frame, text="LOCKDOWN", width=14, height=2, command=on_lockdown)
+lock_btn.pack()
 
 # ---- Version label (bottom-right) ----
 version_label = tk.Label(
