@@ -1,0 +1,426 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import xml.etree.ElementTree as ET
+from collections import OrderedDict, defaultdict
+from pathlib import Path
+import csv
+
+# -----------------------------
+# XML Trace GUI — value splitter
+# -----------------------------
+# 
+# What it does
+# - Opens a trace XML and lists every EVENT / COMMAND / ENTRY as rows
+# - Splits the element text into separate values
+#   * key=value pairs become individual columns
+#   * sequences like "3,02,000,O;" become F1, F2, ... columns
+#   * multi-segments separated by ';' are expanded to multiple rows with SEGMENT index
+# - Dynamic columns per Tag+Type selection (so you see only relevant fields)
+# - Filter box, sorting, and CSV export (current view)
+# - Uses iterparse for low memory
+#
+# Customize TAGS_TO_SHOW to include more/less tags
+
+TAGS_TO_SHOW = ("EVENT", "COMMAND", "ENTRY")
+
+# -----------------------------
+# Parsing helpers
+# -----------------------------
+
+def strip_ns(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def smart_split_payload(text: str):
+    """Split an element text payload into one or more 'segments'.
+    Many traces pack multiple records separated by ';'. Return a list of strings (segments).
+    Empty trailing pieces are removed.
+    """
+    if text is None:
+        return []
+    segs = [s.strip() for s in text.split(";")]
+    return [s for s in segs if s]
+
+
+def parse_segment(segment: str) -> OrderedDict:
+    """Turn a single segment into an OrderedDict of columns.
+    - If it contains any '=' -> treat as comma-separated key=value pairs.
+    - Else -> treat as comma-separated values F1..Fn.
+    Also collapse duplicate keys by suffixing with #2, #3, ... if needed.
+    """
+    out = OrderedDict()
+    segment = segment.strip()
+    if not segment:
+        return out
+
+    parts = [p.strip() for p in segment.split(",") if p.strip() != ""]
+    if any("=" in p for p in parts):
+        # key=value mode
+        seen = defaultdict(int)
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+            else:
+                # no '=' in this part, keep it as a positional field
+                seen["F"] += 1
+                k = f"F{seen['F']}"
+                v = p
+            seen[k] += 1
+            key = k if seen[k] == 1 else f"{k}#{seen[k]}"
+            out[key] = v
+    else:
+        # positional values
+        for i, v in enumerate(parts, 1):
+            out[f"F{i}"] = v
+    return out
+
+
+# -----------------------------
+# Data model
+# -----------------------------
+class Row:
+    __slots__ = ("tag", "type", "date", "time", "segment", "fields", "attrib", "raw")
+
+    def __init__(self, tag: str, etype: str, date: str, time: str, segment: int, fields: OrderedDict, attrib: dict, raw: str):
+        self.tag = tag
+        self.type = etype
+        self.date = date
+        self.time = time
+        self.segment = segment  # 1-based within the element
+        self.fields = fields    # OrderedDict of parsed values
+        self.attrib = attrib    # original attributes
+        self.raw = raw          # original segment text
+
+
+# -----------------------------
+# GUI app
+# -----------------------------
+class XMLTraceGUI(tk.Tk):
+    def __init__(self, xml_path: str | None = None):
+        super().__init__()
+        self.title("XML Trace Value Splitter")
+        self.geometry("1200x720")
+
+        # Full dataset of parsed rows
+        self.all_rows: list[Row] = []
+
+        # Widgets
+        self._build_menu()
+        self._build_toolbar()
+        self._build_tree()
+        self._build_status()
+
+        # State
+        self._sort_state = {"col": None, "asc": True}
+
+        if xml_path:
+            try:
+                self.load_xml(xml_path)
+            except Exception as e:
+                messagebox.showerror("Load error", str(e))
+
+    # ---- UI
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Open…", command=self.on_open)
+        m_file.add_command(label="Export CSV (current view)…", command=self.on_export_csv)
+        m_file.add_separator()
+        m_file.add_command(label="Exit", command=self.destroy)
+        menubar.add_cascade(label="File", menu=m_file)
+        self.config(menu=menubar)
+
+    def _build_toolbar(self):
+        bar = ttk.Frame(self, padding=(8, 6))
+        bar.pack(fill="x")
+
+        ttk.Label(bar, text="Filter:").pack(side="left")
+        self.var_filter = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.var_filter, width=40)
+        e.pack(side="left", padx=(6, 12))
+        self.var_filter.trace_add("write", lambda *_: self.refresh_view())
+
+        ttk.Label(bar, text="Tag:").pack(side="left")
+        self.var_tag = tk.StringVar(value="All")
+        cb_tag = ttk.Combobox(bar, textvariable=self.var_tag, state="readonly", width=10)
+        cb_tag["values"] = ("All",) + TAGS_TO_SHOW
+        cb_tag.pack(side="left", padx=(6, 12))
+        cb_tag.bind("<<ComboboxSelected>>", lambda e: self.on_tag_changed())
+
+        ttk.Label(bar, text="Type:").pack(side="left")
+        self.var_type = tk.StringVar(value="All")
+        self.cb_type = ttk.Combobox(bar, textvariable=self.var_type, state="readonly", width=18)
+        self.cb_type.pack(side="left", padx=(6, 12))
+        self.cb_type.bind("<<ComboboxSelected>>", lambda e: self.refresh_view())
+
+        ttk.Button(bar, text="Open…", command=self.on_open).pack(side="right")
+
+    def _build_tree(self):
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(container, columns=("date","time","tag","type","segment"), show="headings")
+        for col, w in ("date",120), ("time",100), ("tag",90), ("type",140), ("segment",80):
+            self.tree.heading(col, text=col.title(), command=lambda c=col: self.sort_by(c))
+            self.tree.column(col, width=w, anchor="w")
+
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self.on_details)
+
+    def _build_status(self):
+        self.var_status = tk.StringVar(value="Ready")
+        ttk.Label(self, textvariable=self.var_status, anchor="w").pack(fill="x")
+
+    # ---- File actions
+    def on_open(self):
+        path = filedialog.askopenfilename(
+            title="Open trace XML",
+            filetypes=[("XML files", "*.xml *.XML"), ("All files", "*.*")]
+        )
+        if path:
+            self.load_xml(path)
+
+    # ---- Loading & parsing
+    def load_xml(self, path: str | Path):
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(str(p))
+        self.title(f"XML Trace Value Splitter — {p.name}")
+        self.var_status.set(f"Loading {p} …")
+
+        # Reset
+        self.all_rows.clear()
+        self.tree.delete(*self.tree.get_children())
+        self._set_type_choices([])
+
+        # Iterate & parse
+        try:
+            context = ET.iterparse(p, events=("end",))
+            for _, elem in context:
+                tag = strip_ns(elem.tag)
+                if tag not in TAGS_TO_SHOW:
+                    elem.clear()
+                    continue
+
+                date = elem.attrib.get("date", "")
+                time = elem.attrib.get("time", "")
+                etype = elem.attrib.get("type", tag)
+
+                # If COMMAND contains nested ENTRYs but also has text, treat separately
+                payload = (elem.text or "").strip()
+                segments = smart_split_payload(payload) if payload else [""]
+
+                if segments == [""] and list(elem):
+                    # No direct text, but has children -> handle children as separate rows
+                    for child in elem:
+                        ctag = strip_ns(child.tag)
+                        if ctag not in TAGS_TO_SHOW:
+                            continue
+                        ctype = child.attrib.get("type", ctag)
+                        cdate = child.attrib.get("date", date)
+                        ctime = child.attrib.get("time", time)
+                        ctext = (child.text or "").strip()
+                        csegs = smart_split_payload(ctext) if ctext else [""]
+                        for si, seg in enumerate(csegs, start=1):
+                            fields = parse_segment(seg)
+                            self.all_rows.append(Row(ctag, ctype, cdate, ctime, si, fields, dict(child.attrib), seg))
+                else:
+                    # Regular element with its own payload
+                    for si, seg in enumerate(segments, start=1):
+                        fields = parse_segment(seg)
+                        self.all_rows.append(Row(tag, etype, date, time, si, fields, dict(elem.attrib), seg))
+
+                elem.clear()  # free memory
+
+        except ET.ParseError as e:
+            messagebox.showerror("XML Parse Error", str(e))
+            self.var_status.set("Parse error")
+            return
+
+        # Prepare type list by tag, and show initial view
+        self._refresh_type_choices()
+        self.refresh_view()
+        self.var_status.set(f"Loaded {len(self.all_rows):,} rows from {p.name}")
+
+    # ---- Filtering / columns / view
+    def _refresh_type_choices(self):
+        # When tag changes, the Type dropdown shows only types from that tag
+        self.on_tag_changed()
+
+    def on_tag_changed(self):
+        tag = self.var_tag.get()
+        types = sorted({r.type for r in self.all_rows if tag == "All" or r.tag == tag})
+        self._set_type_choices(["All"] + types)
+        self.var_type.set("All")
+        self.refresh_view()
+
+    def _set_type_choices(self, items: list[str]):
+        if not items:
+            items = ["All"]
+        self.cb_type["values"] = items
+        if self.var_type.get() not in items:
+            self.var_type.set(items[0])
+
+    def _current_filter_rows(self) -> list[Row]:
+        q = (self.var_filter.get() or "").lower()
+        tag_sel = self.var_tag.get()
+        type_sel = self.var_type.get()
+        out = []
+        for r in self.all_rows:
+            if tag_sel != "All" and r.tag != tag_sel:
+                continue
+            if type_sel != "All" and r.type != type_sel:
+                continue
+            haystack = " ".join([
+                r.date or "", r.time or "", r.tag or "", r.type or "", r.raw or "",
+                " ".join(f"{k}={v}" for k, v in r.fields.items())
+            ]).lower()
+            if q and q not in haystack:
+                continue
+            out.append(r)
+        return out
+
+    def refresh_view(self):
+        rows = self._current_filter_rows()
+
+        # Build dynamic columns: fixed + the union of field keys in current rows
+        field_keys = []
+        seen = set()
+        for r in rows:
+            for k in r.fields.keys():
+                if k not in seen:
+                    seen.add(k)
+                    field_keys.append(k)
+
+        columns = ("date","time","tag","type","segment") + tuple(field_keys)
+        # Recreate tree columns if changed
+        self.tree["columns"] = columns
+        for col in columns:
+            self.tree.heading(col, text=col.upper(), command=lambda c=col: self.sort_by(c))
+            width = 120 if col in ("date","time") else 90 if col in ("tag","segment") else 140
+            self.tree.column(col, width=width, anchor="w")
+
+        # Clear and insert
+        self.tree.delete(*self.tree.get_children())
+        for r in rows:
+            values = [r.date, r.time, r.tag, r.type, r.segment]
+            for k in field_keys:
+                values.append(r.fields.get(k, ""))
+            self.tree.insert("", "end", values=values, tags=(r.tag, r.type))
+
+        self.var_status.set(f"Showing {len(rows):,} row(s)")
+
+    # ---- Sorting
+    def sort_by(self, column: str):
+        # Fetch displayed items
+        items = [(iid, self.tree.item(iid, "values")) for iid in self.tree.get_children("")]
+        if not items:
+            return
+
+        cols = self.tree["columns"]
+        try:
+            col_idx = cols.index(column)
+        except ValueError:
+            return
+
+        asc = True
+        if self._sort_state["col"] == column:
+            asc = not self._sort_state["asc"]
+        self._sort_state.update({"col": column, "asc": asc})
+
+        def coerce(x):
+            # try numeric then fall back to string
+            try:
+                return float(x)
+            except Exception:
+                return str(x)
+
+        items.sort(key=lambda it: coerce(it[1][col_idx]), reverse=not asc)
+        for i, (iid, _) in enumerate(items):
+            self.tree.move(iid, "", i)
+
+    # ---- Details dialog
+    def on_details(self, _evt=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        vals = self.tree.item(sel[0], "values")
+        cols = self.tree["columns"]
+        data = OrderedDict((c, v) for c, v in zip(cols, vals))
+
+        win = tk.Toplevel(self)
+        win.title("Row details")
+        win.geometry("800x520")
+
+        frm = ttk.Frame(win, padding=8)
+        frm.pack(fill="both", expand=True)
+
+        # Attribute box
+        text = tk.Text(frm, wrap="word")
+        lines = ["Details:\n"]
+        for k, v in data.items():
+            lines.append(f"- {k}: {v}")
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+        text.pack(fill="both", expand=True)
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+
+    # ---- Export
+    def on_export_csv(self):
+        rows = self._current_filter_rows()
+        if not rows:
+            messagebox.showinfo("Export CSV", "No rows to export.")
+            return
+        # Build header
+        field_keys = []
+        seen = set()
+        for r in rows:
+            for k in r.fields.keys():
+                if k not in seen:
+                    seen.add(k)
+                    field_keys.append(k)
+        header = ["date","time","tag","type","segment"] + field_keys
+
+        path = filedialog.asksaveasfilename(
+            title="Save CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile="trace_view.csv",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                for r in rows:
+                    row = [r.date, r.time, r.tag, r.type, r.segment]
+                    for k in field_keys:
+                        row.append(r.fields.get(k, ""))
+                    w.writerow(row)
+            messagebox.showinfo("Export CSV", f"Saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Export CSV", str(e))
+
+
+if __name__ == "__main__":
+    # On your machine, either pass a path or use File → Open…
+    # Example to auto-open a file:
+    # app = XMLTraceGUI(r"C:\\path\\to\\20241225.TRC.XML")
+    app = XMLTraceGUI()
+    app.mainloop()

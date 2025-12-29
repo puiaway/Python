@@ -8,7 +8,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 class TextSearchApp:
     def __init__(self, master):
         self.master = master
-        master.title("Text Search in Folder (10,000+ Files + Cancel)")
+        master.title("Text Search in Folder CSV (10,000+ Files + Cancel)")
         master.geometry("840x640")
 
         # Folder Selection
@@ -80,7 +80,7 @@ class TextSearchApp:
         file_list = []
         for root, dirs, files in os.walk(folder):
             for file in files:
-                if file.endswith(('.txt', '.log', '.csv', '.json')):
+                if file.endswith(('.txt', '.log', '.csv','.XML', '.json')):
                     file_list.append(os.path.join(root, file))
 
         total_files = len(file_list)
